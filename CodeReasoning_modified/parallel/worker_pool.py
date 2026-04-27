@@ -92,7 +92,11 @@ class WorkerPool:
                 if len(file_mutations) == 1:
                     m = file_mutations[0]
                     success = mutation_applier.apply_mutation_to_file(
-                        target_file, m['line_number'], m['original_code'], m['mutated_code']
+                        target_file,
+                        m['line_number'],
+                        m['original_code'],
+                        m['mutated_code'],
+                        m.get('match_index')
                     )
                 else:
                     success = mutation_applier.apply_multiple_mutations(target_file, file_mutations)

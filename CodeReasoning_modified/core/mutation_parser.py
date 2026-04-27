@@ -29,7 +29,18 @@ class MutationParser:
                 return None
             
             mutant_id, mutator, original_sig, mutated_sig = parts[0:4]
-            class_method, line_num, garbage, code = parts[4:8]
+            class_method = parts[4]
+            line_num = parts[5] if len(parts) > 5 else ""
+            target_file = None
+            
+            if len(parts) >= 9:
+                target_file = parts[6]
+                
+                code = ":".join(parts[8:])
+            else:
+                garbage = parts[6] if len(parts) > 6 else ""
+                code = ":".join(parts[7:]) if len(parts) > 7 else ""
+            
             
             # Extract code change
             if '|==>' in code:
@@ -56,6 +67,13 @@ class MutationParser:
             except ValueError:
                 return None
             
+            match_index = None
+            if mutator == "LVR":
+                if original_sig.isdigit():
+                    match_index = int(original_sig)
+                elif mutated_sig.isdigit():
+                    match_index = int(mutated_sig)
+
             return {
                 'whole_log': line,
                 'mutant_id': mutant_id,
@@ -66,7 +84,9 @@ class MutationParser:
                 'method_name': method_name,
                 'line_number': line_number,
                 'original_code': original_code,
-                'mutated_code': mutated_code
+                'mutated_code': mutated_code,
+                'target_file': target_file,
+                'match_index': match_index
             }
             
         except Exception as e:

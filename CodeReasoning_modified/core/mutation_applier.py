@@ -219,7 +219,8 @@ class MutationApplier:
     
     @staticmethod
     def apply_mutation_to_file(source_file: Path, line_number: int, 
-                             original_code: str, mutated_code: str) -> bool:
+                             original_code: str, mutated_code: str,
+                             match_index: Optional[int] = None) -> bool:
         """Apply mutation to a specific file"""
         try:
             if not source_file.exists():
@@ -234,9 +235,27 @@ class MutationApplier:
             target_line_index = line_number - 1
             original_line = lines[target_line_index]
             
+            def replace_nth_occurrence(line: str, old: str, new: str, index: int) -> Optional[str]:
+                if not old:
+                    return None
+                start = 0
+                for i in range(index + 1):
+                    pos = line.find(old, start)
+                    if pos == -1:
+                        return None
+                    if i == index:
+                        return line[:pos] + new + line[pos + len(old):]
+                    start = pos + len(old)
+                return None
+
             # Try exact replacement
             if original_code in original_line:
-                mutated_line = original_line.replace(original_code, mutated_code)
+                if match_index is not None:
+                    mutated_line = replace_nth_occurrence(original_line, original_code, mutated_code, match_index)
+                    if mutated_line is None:
+                        return False
+                else:
+                    mutated_line = original_line.replace(original_code, mutated_code)
                 lines[target_line_index] = mutated_line
             
             # Try with stripped whitespace
@@ -245,13 +264,19 @@ class MutationApplier:
                 stripped_line = original_line.strip()
                 
                 if stripped_original in stripped_line:
-                    start_idx = original_line.find(stripped_original)
-                    if start_idx != -1:
-                        end_idx = start_idx + len(stripped_original)
-                        before = original_line[:start_idx]
-                        after = original_line[end_idx:]
-                        mutated_line = before + mutated_code + after
+                    if match_index is not None:
+                        mutated_line = replace_nth_occurrence(original_line, stripped_original, mutated_code, match_index)
+                        if mutated_line is None:
+                            return False
                         lines[target_line_index] = mutated_line
+                    else:
+                        start_idx = original_line.find(stripped_original)
+                        if start_idx != -1:
+                            end_idx = start_idx + len(stripped_original)
+                            before = original_line[:start_idx]
+                            after = original_line[end_idx:]
+                            mutated_line = before + mutated_code + after
+                            lines[target_line_index] = mutated_line
             else:
                 return False
             
@@ -281,29 +306,54 @@ class MutationApplier:
                 line_number = mutation['line_number']
                 original_code = mutation['original_code']
                 mutated_code = mutation['mutated_code']
-                
+                match_index = mutation.get('match_index')
+
                 if line_number < 1 or line_number > len(lines):
                     continue
                 
                 target_line_index = line_number - 1
                 original_line = lines[target_line_index]
                 
+                def replace_nth_occurrence(line: str, old: str, new: str, index: int) -> Optional[str]:
+                    if not old:
+                        return None
+                    start = 0
+                    for i in range(index + 1):
+                        pos = line.find(old, start)
+                        if pos == -1:
+                            return None
+                        if i == index:
+                            return line[:pos] + new + line[pos + len(old):]
+                        start = pos + len(old)
+                    return None
+
                 # Apply mutation
                 if original_code in original_line:
-                    mutated_line = original_line.replace(original_code, mutated_code)
+                    if match_index is not None:
+                        mutated_line = replace_nth_occurrence(original_line, original_code, mutated_code, match_index)
+                        if mutated_line is None:
+                            continue
+                    else:
+                        mutated_line = original_line.replace(original_code, mutated_code)
                     lines[target_line_index] = mutated_line
                 elif original_code.strip() in original_line.strip():
                     stripped_original = original_code.strip()
                     stripped_line = original_line.strip()
                     
                     if stripped_original in stripped_line:
-                        start_idx = original_line.find(stripped_original)
-                        if start_idx != -1:
-                            end_idx = start_idx + len(stripped_original)
-                            before = original_line[:start_idx]
-                            after = original_line[end_idx:]
-                            mutated_line = before + mutated_code + after
+                        if match_index is not None:
+                            mutated_line = replace_nth_occurrence(original_line, stripped_original, mutated_code, match_index)
+                            if mutated_line is None:
+                                continue
                             lines[target_line_index] = mutated_line
+                        else:
+                            start_idx = original_line.find(stripped_original)
+                            if start_idx != -1:
+                                end_idx = start_idx + len(stripped_original)
+                                before = original_line[:start_idx]
+                                after = original_line[end_idx:]
+                                mutated_line = before + mutated_code + after
+                                lines[target_line_index] = mutated_line
             
             # Write all changes at once
             with open(source_file, 'w') as f:
