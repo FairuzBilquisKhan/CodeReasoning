@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 import re
 
-from config.settings import DEFECTS4J_EXECUTABLE, COVERAGE_TIMEOUT
+from config.settings import DEFECTS4J_EXECUTABLE, COVERAGE_TIMEOUT, COMPILE_TIMEOUT
+from utils.file_ops import kill_processes_for_path, find_java_file_by_class
 
 
 class CoverageRunner:
@@ -34,8 +35,8 @@ class CoverageRunner:
                     failing_tests = row.get('failingTests', '').strip()
                     if not bug_key or not failing_tests:
                         continue
-                    # take first test only (comma-separated list)
-                    first_test = failing_tests.split(',')[0].strip()
+                    # take first test only (semicolon-separated list)
+                    first_test = failing_tests.split(';')[0].strip()
                     if first_test:
                         bug_test_map[bug_key] = first_test
             print(f"[INFO] Loaded {len(bug_test_map)} bug test mappings from {csv_path}")
@@ -87,24 +88,61 @@ class CoverageRunner:
     
     def run_command(self, command: List[str], working_dir: Path, step_name: str = "Command"):
         """Run a shell command with proper error handling"""
-        print(f"    Running: {' '.join(command)}")
+        print(f"    Running: {' '.join(command)}", flush=True)
         try:
             result = subprocess.run(
-                command, check=True, capture_output=True, text=True, cwd=working_dir
+                command, check=True, capture_output=True, text=True,
+                cwd=working_dir, timeout=COMPILE_TIMEOUT
             )
             return result
+        except subprocess.TimeoutExpired:
+            print(f"    {step_name} timed out after {COMPILE_TIMEOUT}s", flush=True)
+            return None
         except subprocess.CalledProcessError as e:
-            # Print full stdout/stderr for easier debugging (e.g., missing tools or compile errors)
-            print(f"    Command failed: {e}")
+            print(f"    Command failed: {e}", flush=True)
             if hasattr(e, 'stdout') and e.stdout:
-                print(f"    stdout:\n{e.stdout}")
+                print(f"    stdout:\n{e.stdout}", flush=True)
             if hasattr(e, 'stderr') and e.stderr:
-                print(f"    stderr:\n{e.stderr}")
+                print(f"    stderr:\n{e.stderr}", flush=True)
             return None
     
     def compile_mutant(self, mutant_dir: Path) -> bool:
         """Compile the mutant"""
         return bool(self.run_command([self.defects4j_cmd, "compile"], mutant_dir, "Compile mutant"))
+
+    @staticmethod
+    def _jvm_sig_to_java_params(signature: str) -> str:
+        """Convert JVM signature like (ILjava/lang/String;[D)V to (int,java.lang.String,double[])."""
+        if not signature or '(' not in signature or ')' not in signature:
+            return signature
+        params_str = signature[signature.find('(') + 1:signature.find(')')]
+        primitives = {
+            'B': 'byte', 'C': 'char', 'D': 'double', 'F': 'float',
+            'I': 'int', 'J': 'long', 'S': 'short', 'Z': 'boolean',
+        }
+        params = []
+        i = 0
+        array_depth = 0
+        while i < len(params_str):
+            char = params_str[i]
+            if char == '[':
+                array_depth += 1
+                i += 1
+            elif char == 'L':
+                end = params_str.find(';', i)
+                if end == -1:
+                    break
+                class_ref = params_str[i + 1:end].replace('/', '.')
+                params.append(class_ref + '[]' * array_depth)
+                array_depth = 0
+                i = end + 1
+            elif char in primitives:
+                params.append(primitives[char] + '[]' * array_depth)
+                array_depth = 0
+                i += 1
+            else:
+                i += 1
+        return f"({','.join(params)})"
 
     @staticmethod
     def _count_params_from_jvm_signature(signature: str) -> int:
@@ -128,18 +166,6 @@ class CoverageRunner:
                 count += 1
                 i += 1
         return count
-
-    @staticmethod
-    def _find_java_file_by_class(class_name: str, base_dir: Path) -> Optional[Path]:
-        """Find Java source file for a fully-qualified class name under base_dir."""
-        if not class_name:
-            return None
-        rel_path = Path(*class_name.split('.')).with_suffix('.java')
-        direct = base_dir / rel_path
-        if direct.exists():
-            return direct
-        matches = list(base_dir.rglob(str(rel_path)))
-        return matches[0] if matches else None
 
     @staticmethod
     def _find_method_start_line(source_file: Path, method_name: str, param_count: int) -> Optional[int]:
@@ -222,24 +248,14 @@ class CoverageRunner:
             branch_rate = float(root.attrib.get('branch-rate', '0'))
             for cls in root.findall('.//class'):
                 class_name = cls.get('name')
-                java_file = self._find_java_file_by_class(class_name, base_dir) if base_dir else None
+                java_file = find_java_file_by_class(class_name, [base_dir]) if base_dir else None
                 for method in cls.findall('.//method'):
                     method_name = method.get('name')
                     method_signature = method.get('signature', '')
-                    if method_name == "<init>":
-                        simple_class_name = class_name.split('.')[-1] if class_name else ""
-                        translated_method_name = simple_class_name
-                    elif method_name == "<clinit>":
-                        translated_method_name = "static initializer"
-                    else:
-                        translated_method_name = method_name
-                    full_method_name = f"{class_name}.{translated_method_name}{method_signature}"
+                    java_params = self._jvm_sig_to_java_params(method_signature)
+                    full_method_name = f"{class_name}:{method_name}{java_params}"
                     line_numbers = []
                     has_nonzero_hits = False
-                    start_line = None
-                    if java_file and method_name:
-                        param_count = self._count_params_from_jvm_signature(method_signature)
-                        start_line = self._find_method_start_line(java_file, method_name, param_count)
                     for line in method.findall('.//line'):
                         line_number = line.get('number')
                         hit_count = line.get('hits')
@@ -255,22 +271,13 @@ class CoverageRunner:
                                 if parsed_hits <= 0:
                                     continue
                                 has_nonzero_hits = True
-                            try:
-                                parsed_line_number = int(line_number)
-                            except ValueError:
-                                parsed_line_number = None
-                            relative_line_number = parsed_line_number
-                            if start_line is not None and parsed_line_number is not None:
-                                candidate = parsed_line_number - start_line
-                                if candidate >= 0:
-                                    relative_line_number = candidate
                             if branch == 'true':
                                 ratio, conditions_detail = self._format_branch_conditions(line)
                                 line_numbers.append(
-                                    f"{relative_line_number}|{hit_count}|{ratio}|{conditions_detail}"
+                                    f"{line_number}|{hit_count}|{ratio}|{conditions_detail}"
                                 )
                             else:
-                                line_numbers.append(f"{relative_line_number}|{hit_count}")
+                                line_numbers.append(f"{line_number}|{hit_count}")
                     if has_nonzero_hits:
                         method_data[full_method_name] = line_numbers
             return line_rate, branch_rate, method_data
@@ -278,6 +285,32 @@ class CoverageRunner:
             print(f"Error parsing {xml_file}: {e}")
             return 0.0, 0.0, {}
     
+    @staticmethod
+    def build_covered_lines(xml_file: Path, modified_classes: List[str]) -> Dict[str, set]:
+        """Parse coverage.xml and return {class_name: set(line_numbers with hits > 0)}
+        restricted to classes listed in modified_classes."""
+        modified_set = set(modified_classes)
+        covered: Dict[str, set] = {}
+        try:
+            tree = ET.parse(xml_file)
+            root = tree.getroot()
+            for cls in root.findall('.//class'):
+                class_name = cls.get('name', '')
+                if class_name not in modified_set:
+                    continue
+                covered_lines: set = set()
+                for line in cls.findall('.//line'):
+                    try:
+                        if int(line.get('hits', '0')) > 0:
+                            covered_lines.add(int(line.get('number')))
+                    except (ValueError, TypeError):
+                        pass
+                if covered_lines:
+                    covered[class_name] = covered_lines
+        except Exception as e:
+            print(f"Error building covered lines from {xml_file}: {e}")
+        return covered
+
     def parse_failing_tests(self, mutant_dir: Path) -> List[str]:
         """Parse failing tests from failing_tests file"""
         failing_tests_file = mutant_dir / "failing_tests"
@@ -359,7 +392,7 @@ class CoverageRunner:
             print("   Coverage command timed out")
             coverage_result['coverage_output'] = "TIMEOUT"
             try:
-                self._kill_processes_for_path(mutant_dir)
+                kill_processes_for_path(mutant_dir)
                 coverage_result['coverage_output'] += "; killed lingering processes"
             except Exception as e:
                 coverage_result['coverage_output'] += f"; cleanup error: {e}"
@@ -369,37 +402,3 @@ class CoverageRunner:
 
         return coverage_result
 
-    def _kill_processes_for_path(self, path: Path, timeout: int = 5):
-        """Kill processes whose command line references the given path (best-effort).
-
-        Uses pgrep -f to find matching processes, sends SIGTERM then SIGKILL after a short wait.
-        """
-        import subprocess, os, signal, time
-        try:
-            cmd = ["pgrep", "-f", str(path)]
-            out = subprocess.check_output(cmd, text=True).strip()
-            if not out:
-                return
-            pids = [int(p) for p in out.splitlines() if p.strip().isdigit()]
-        except subprocess.CalledProcessError:
-            return
-
-        for pid in pids:
-            try:
-                print(f"   [CLEANUP] Terminating PID {pid} for path {path}")
-                os.kill(pid, signal.SIGTERM)
-            except Exception:
-                pass
-
-        time.sleep(timeout)
-
-        for pid in pids:
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                continue
-            try:
-                print(f"   [CLEANUP] Killing PID {pid} (SIGKILL)")
-                os.kill(pid, signal.SIGKILL)
-            except Exception:
-                pass

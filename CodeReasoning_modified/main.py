@@ -10,9 +10,10 @@ import os
 import random
 import platform
 from pathlib import Path
+from typing import Dict, List, Optional
 
 # OVERRIDE: Force use of home directory to avoid macOS permissions
-BASE_CHECKOUT_DIR = Path("/home/cc/mutated_codes")
+BASE_CHECKOUT_DIR = Path("/mnt/data/mutated_codes")
 BASE_CHECKOUT_DIR.mkdir(exist_ok=True)
 
 # Add the parent directory to Python path
@@ -48,77 +49,86 @@ class MutantGenerator:
         random.seed(random_seed)
     
     def process_single_bug(self, project_id: str, bug_id: str,
-                          mutant_percentage: int, max_mutations: int) -> bool:
+                          mutant_percentage: int, max_mutations: int,
+                          filter_mutations: bool = True) -> bool:
         """Process bug with ISOLATION and REPRODUCIBILITY"""
-        
+
         # CLEANUP any previous runs for THIS bug only
         self._cleanup_bug_directories(project_id, bug_id)
-        
-        # Create ISOLATED directories
-        fixed_dir = BASE_CHECKOUT_DIR / f"{project_id}_{bug_id}f"
+
         buggy_dir = BASE_CHECKOUT_DIR / f"{project_id}_{bug_id}b"
         mutants_output_dir = BASE_CHECKOUT_DIR / f"{project_id}_{bug_id}_mutants"
-        
+
         print(f"\n{'='*60}")
         print(f"ISOLATED PROCESS: {project_id}-{bug_id}")
         print(f"Seed: {self.random_seed}")
-        print(f"Fixed dir: {fixed_dir}")
         print(f"Buggy dir: {buggy_dir}")
         print(f"Output: {mutants_output_dir}")
         print(f"{'='*60}")
-        
+
         try:
-            # Setup fixed and buggy projects
-            if not self._setup_project(project_id, bug_id, fixed_dir, buggy_dir):
+            # Setup buggy project; modified_classes is [] when filtering is disabled
+            modified_classes = self._setup_project(project_id, bug_id, buggy_dir, filter_mutations)
+            if modified_classes is None:
                 return False
-            
+
             # Get source directories from buggy version
             source_dirs = self.project_manager.get_source_directories(buggy_dir)
             if not source_dirs:
                 print("✗ No source directories found")
                 return False
-            
+
             relative_source_dirs = self.file_ops.get_relative_paths(source_dirs, buggy_dir)
-            
-            # Get mutations with PROJECT-SPECIFIC seed
+
+            # Get mutations with PROJECT-SPECIFIC seed (deterministic)
             mutation_applier = MutationApplier(
                 random_seed=self.random_seed,
                 project_id=project_id,
                 bug_id=bug_id
             )
-            
-            mutations = self._select_mutations(fixed_dir, mutation_applier, 
-                                             mutant_percentage, max_mutations)
+
+            mutations = self._select_mutations(
+                buggy_dir, mutation_applier, mutant_percentage, max_mutations,
+                modified_classes, filter_mutations
+            )
             if not mutations:
                 return False
-            
+
             # Process with isolation
             worker_pool = WorkerPool(max_workers=self.max_workers)
             successful_mutants, failed_mutants = worker_pool.process_mutants_parallel(
-                buggy_dir, mutants_output_dir, mutations, 
+                buggy_dir, mutants_output_dir, mutations,
                 project_id, bug_id, relative_source_dirs
             )
-            
+
             if successful_mutants:
                 # VERIFY all mutants belong to this bug
                 verified_mutants = [
-                    m for m in successful_mutants 
+                    m for m in successful_mutants
                     if m.get('project_id') == project_id and m.get('bug_id') == bug_id
                 ]
-                
+
                 if len(verified_mutants) != len(successful_mutants):
                     print(f"WARNING: {len(successful_mutants) - len(verified_mutants)} "
                           f"mutants had incorrect project/bug tags!")
-                
-                self._generate_json_results(verified_mutants, mutants_output_dir, 
-                                          project_id, bug_id)
-                
+
+                # Cap at 10 mutants per unique method coverage fingerprint
+                verified_mutants = self._cap_by_method_coverage(verified_mutants)
+
+                # Write JSON directly to BASE_CHECKOUT_DIR so it survives cleanup
+                self._generate_json_results(verified_mutants, BASE_CHECKOUT_DIR,
+                                            project_id, bug_id)
+
+                # Cleanup working directories now that JSON is written
+                self.file_ops.clean_directory(buggy_dir)
+                self.file_ops.clean_directory(mutants_output_dir)
+
                 print(f"✓ Successfully processed {project_id}-{bug_id}: {len(verified_mutants)} mutants")
                 return True
-            
+
             print("✗ No mutants created successfully")
             return False
-            
+
         except Exception as e:
             print(f"ERROR in {project_id}-{bug_id}: {e}")
             import traceback
@@ -132,14 +142,13 @@ class MutantGenerator:
     def _cleanup_bug_directories(self, project_id: str, bug_id: str):
         """Clean up ONLY directories for this specific bug"""
         import shutil
-        
+
         patterns = [
-            f"{project_id}_{bug_id}f",
             f"{project_id}_{bug_id}b",
             f"{project_id}_{bug_id}_mutants",
             f"temp_mutant_{project_id}_{bug_id}_*"
         ]
-        
+
         for pattern in patterns:
             for item in BASE_CHECKOUT_DIR.glob(pattern):
                 try:
@@ -151,60 +160,92 @@ class MutantGenerator:
                     pass
     
     def _setup_project(self, project_id: str, bug_id: str,
-                      fixed_dir: Path, buggy_dir: Path) -> bool:
-        """Setup fixed+buggy projects: checkout fixed, compile, mutation; checkout buggy."""
-        # Clean existing directories
-        self.file_ops.clean_directory(fixed_dir)
+                      buggy_dir: Path, filter_mutations: bool = True) -> Optional[List]:
+        """Checkout buggy version and run mutation testing.
+
+        When filter_mutations=True also exports modified classes and returns
+        them as a list. Returns [] when filtering is disabled, None on failure.
+        """
         self.file_ops.clean_directory(buggy_dir)
 
-        # Checkout fixed and compile
-        if not self.project_manager.checkout_project_version(project_id, bug_id, "f", fixed_dir, compile_project=True):
-            return False
+        # 1. Checkout and compile buggy version
+        if not self.project_manager.checkout_project_version(
+                project_id, bug_id, "b", buggy_dir, compile_project=True):
+            return None
 
-        # Run mutation testing on fixed to generate mutants.log and kill.csv
+        # 2. Run mutation testing on buggy version → mutants.log
         target_test = self.project_manager.get_target_test(project_id, bug_id)
-        if not self.project_manager.run_mutation_testing(fixed_dir, target_test):
-            return False
+        if not self.project_manager.run_mutation_testing(buggy_dir, target_test):
+            return None
 
-        # Checkout buggy version (no compile needed here)
-        if not self.project_manager.checkout_project_version(project_id, bug_id, "b", buggy_dir, compile_project=False):
-            return False
+        if not filter_mutations:
+            print("   Class filtering disabled — using all mutations")
+            return []
 
-        return True
+        # 3. Export modified classes
+        modified_classes = self.project_manager.export_modified_classes(buggy_dir)
+        if not modified_classes:
+            print("✗ No modified classes found")
+            return None
+
+        print(f"✓ Filtering by {len(modified_classes)} modified classes")
+        return modified_classes
     
     def _select_mutations(self, work_dir: Path, mutation_applier: MutationApplier,
-                         mutant_percentage: int, max_mutations: int) -> list:
-        """Select mutations with project-specific isolation"""
+                         mutant_percentage: int, max_mutations: int,
+                         modified_classes: List, filter_mutations: bool = True) -> list:
+        """Select mutations, optionally filtered by modified classes."""
         log_file = self.mutation_parser.find_mutants_log(work_dir)
         if not log_file:
             print("✗ No mutants.log found")
             return []
-        
+
         all_mutations = self.mutation_parser.parse_all_mutations(log_file)
         if not all_mutations:
             print("✗ No mutations parsed")
             return []
 
-        # Filter using kill.csv (FAIL/KILLED only)
-        kill_csv = work_dir / "kill.csv"
-        all_mutations = self.mutation_parser.filter_mutations_by_kill_csv(all_mutations, kill_csv)
-        if not all_mutations:
-            print("✗ No mutations after kill.csv filtering")
-            return []
-        
+        if filter_mutations:
+            all_mutations = self.mutation_parser.filter_mutations_by_modified_classes(
+                all_mutations, modified_classes
+            )
+            if not all_mutations:
+                print("✗ No mutations after class filtering")
+                return []
+        else:
+            print(f"   Class filtering disabled — keeping all {len(all_mutations)} mutations")
+
         # Calculate number of mutants based on percentage
         num_mutants = max(1, int(len(all_mutations) * mutant_percentage / 100))
         print(f"Total mutations available: {len(all_mutations)}")
         print(f"Creating {num_mutants} mutants ({mutant_percentage}%)")
-        
-        # Use the project-specific applier
+
+        # Deterministic selection via project-specific seed
         selected_mutants = mutation_applier.generate_unique_mutants(
             all_mutations, num_mutants, max_mutations
         )
-        
+
         print(f"Generated {len(selected_mutants)} unique mutant combinations")
         return selected_mutants
     
+    @staticmethod
+    def _cap_by_method_coverage(mutants: list, max_per_coverage: int = 20) -> list:
+        """Drop mutants once a unique method-coverage fingerprint has appeared max_per_coverage times."""
+        import json
+        from collections import defaultdict
+        counts: defaultdict = defaultdict(int)
+        result = []
+        for m in mutants:
+            key = json.dumps(m.get('method_coverage', {}), sort_keys=True)
+            if counts[key] < max_per_coverage:
+                counts[key] += 1
+                result.append(m)
+        dropped = len(mutants) - len(result)
+        if dropped:
+            print(f"   Capped identical method coverage: dropped {dropped} mutants "
+                  f"({len(result)} kept, limit={max_per_coverage} per fingerprint)")
+        return result
+
     def _generate_json_results(self, successful_mutants: list, output_dir: Path, 
                              project_id: str, bug_id: str) -> None:
         """Generate JSON results"""
@@ -329,6 +370,13 @@ def main():
         default=42,
         help="Random seed for reproducible mutant selection (default: 42)"
     )
+
+    parser.add_argument(
+        "--no-filter",
+        action="store_true",
+        default=False,
+        help="Disable coverage-based filtering and use all mutations from mutants.log"
+    )
     
     args = parser.parse_args()
     
@@ -354,6 +402,7 @@ def main():
     print(f"Workers: {args.workers}")
     print(f"Output: {BASE_CHECKOUT_DIR}")
     print(f"Output Format: JSON")
+    print(f"Coverage Filtering: {'disabled' if args.no_filter else 'enabled'}")
     print(f"Features: Isolation ✓ | Cross-platform reproducibility ✓")
     print("=" * 60)
     
@@ -373,7 +422,10 @@ def main():
             print(f"\nMerging JSON results for {previous_project}...")
             generator.merge_project_results(previous_project)
         
-        success = generator.process_single_bug(project_id, bug_id, args.percentage, args.max_mutations)
+        success = generator.process_single_bug(
+            project_id, bug_id, args.percentage, args.max_mutations,
+            filter_mutations=not args.no_filter
+        )
         if success:
             success_count += 1
         

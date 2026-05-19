@@ -69,10 +69,18 @@ class MutationParser:
             
             match_index = None
             if mutator == "LVR":
-                if original_sig.isdigit():
-                    match_index = int(original_sig)
-                elif mutated_sig.isdigit():
-                    match_index = int(mutated_sig)
+                def extract_index(value: str) -> Optional[int]:
+                    if not value:
+                        return None
+                    value = value.strip()
+                    if not value.isdigit():
+                        return None
+                    index_val = int(value)
+                    return index_val - 1 if index_val > 0 else 0
+
+                match_index = extract_index(original_sig)
+                if match_index is None:
+                    match_index = extract_index(mutated_sig)
 
             return {
                 'whole_log': line,
@@ -111,6 +119,14 @@ class MutationParser:
         
         print(f"Parsed {len(all_mutations)} total mutations")
         return all_mutations
+
+    @staticmethod
+    def filter_mutations_by_modified_classes(mutations: List[Dict], modified_classes: List[str]) -> List[Dict]:
+        """Keep only mutations whose class_name is in the modified classes list."""
+        modified_set = set(modified_classes)
+        filtered = [m for m in mutations if m.get('class_name') in modified_set]
+        print(f"Filtered mutations by modified classes: {len(filtered)} of {len(mutations)}")
+        return filtered
 
     @staticmethod
     def load_kill_csv_ids(kill_csv: Path) -> List[str]:

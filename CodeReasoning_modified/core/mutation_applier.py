@@ -162,7 +162,9 @@ class MutationApplier:
         param_str = ""
         if '(' in method_name and ')' in method_name:
             param_str = method_name[method_name.find('(') + 1:method_name.rfind(')')]
-        expected_param_count = MutationApplier._count_params(param_str) if param_str else None
+            expected_param_count = MutationApplier._count_params(param_str)
+        else:
+            expected_param_count = None
 
         try:
             with open(source_file, 'r', encoding='utf-8', errors='ignore') as f:
@@ -199,25 +201,6 @@ class MutationApplier:
         return relative_line if relative_line >= 0 else None
     
     @staticmethod
-    def find_java_file_by_class(class_name: str, source_dirs: List[Path]) -> Optional[Path]:
-        """Find Java file by class name across source directories"""
-        file_rel_path = class_name.replace('.', '/') + '.java'
-        
-        for src_dir in source_dirs:
-            # Try direct path
-            direct_path = src_dir / file_rel_path
-            if direct_path.exists():
-                return direct_path
-            
-            # Try common Maven structures
-            for prefix in ["src/main/java", "src/java"]:
-                maven_path = src_dir / prefix / file_rel_path
-                if maven_path.exists():
-                    return maven_path
-        
-        return None
-    
-    @staticmethod
     def apply_mutation_to_file(source_file: Path, line_number: int, 
                              original_code: str, mutated_code: str,
                              match_index: Optional[int] = None) -> bool:
@@ -235,50 +218,38 @@ class MutationApplier:
             target_line_index = line_number - 1
             original_line = lines[target_line_index]
             
-            def replace_nth_occurrence(line: str, old: str, new: str, index: int) -> Optional[str]:
+            def replace_nth_whole_match(line: str, old: str, new: str, index: int) -> Optional[str]:
                 if not old:
                     return None
-                start = 0
-                for i in range(index + 1):
-                    pos = line.find(old, start)
-                    if pos == -1:
-                        return None
-                    if i == index:
-                        return line[:pos] + new + line[pos + len(old):]
-                    start = pos + len(old)
-                return None
+                pattern = rf"(?<!\S){re.escape(old)}(?!\S)"
+                matches = list(re.finditer(pattern, line))
+                if index < 0 or index >= len(matches):
+                    return None
+                match = matches[index]
+                return line[:match.start()] + new + line[match.end():]
 
-            # Try exact replacement
-            if original_code in original_line:
-                if match_index is not None:
-                    mutated_line = replace_nth_occurrence(original_line, original_code, mutated_code, match_index)
-                    if mutated_line is None:
-                        return False
-                else:
-                    mutated_line = original_line.replace(original_code, mutated_code)
-                lines[target_line_index] = mutated_line
-            
-            # Try with stripped whitespace
-            elif original_code.strip() in original_line.strip():
-                stripped_original = original_code.strip()
-                stripped_line = original_line.strip()
-                
-                if stripped_original in stripped_line:
-                    if match_index is not None:
-                        mutated_line = replace_nth_occurrence(original_line, stripped_original, mutated_code, match_index)
-                        if mutated_line is None:
-                            return False
-                        lines[target_line_index] = mutated_line
-                    else:
-                        start_idx = original_line.find(stripped_original)
-                        if start_idx != -1:
-                            end_idx = start_idx + len(stripped_original)
-                            before = original_line[:start_idx]
-                            after = original_line[end_idx:]
-                            mutated_line = before + mutated_code + after
-                            lines[target_line_index] = mutated_line
-            else:
+            def replace_all_whole_matches(line: str, old: str, new: str) -> Optional[str]:
+                if not old:
+                    return None
+                pattern = rf"(?<!\S){re.escape(old)}(?!\S)"
+                if not re.search(pattern, line):
+                    return None
+                return re.sub(pattern, new, line)
+
+            token = original_code.strip()
+            if not token:
                 return False
+
+            if match_index is not None:
+                mutated_line = replace_nth_whole_match(original_line, token, mutated_code, match_index)
+                if mutated_line is None:
+                    return False
+            else:
+                mutated_line = replace_all_whole_matches(original_line, token, mutated_code)
+                if mutated_line is None:
+                    return False
+
+            lines[target_line_index] = mutated_line
             
             # Write the modified content back
             with open(source_file, 'w') as f:
@@ -314,46 +285,38 @@ class MutationApplier:
                 target_line_index = line_number - 1
                 original_line = lines[target_line_index]
                 
-                def replace_nth_occurrence(line: str, old: str, new: str, index: int) -> Optional[str]:
+                def replace_nth_whole_match(line: str, old: str, new: str, index: int) -> Optional[str]:
                     if not old:
                         return None
-                    start = 0
-                    for i in range(index + 1):
-                        pos = line.find(old, start)
-                        if pos == -1:
-                            return None
-                        if i == index:
-                            return line[:pos] + new + line[pos + len(old):]
-                        start = pos + len(old)
-                    return None
+                    pattern = rf"(?<!\S){re.escape(old)}(?!\S)"
+                    matches = list(re.finditer(pattern, line))
+                    if index < 0 or index >= len(matches):
+                        return None
+                    match = matches[index]
+                    return line[:match.start()] + new + line[match.end():]
 
-                # Apply mutation
-                if original_code in original_line:
-                    if match_index is not None:
-                        mutated_line = replace_nth_occurrence(original_line, original_code, mutated_code, match_index)
-                        if mutated_line is None:
-                            continue
-                    else:
-                        mutated_line = original_line.replace(original_code, mutated_code)
-                    lines[target_line_index] = mutated_line
-                elif original_code.strip() in original_line.strip():
-                    stripped_original = original_code.strip()
-                    stripped_line = original_line.strip()
-                    
-                    if stripped_original in stripped_line:
-                        if match_index is not None:
-                            mutated_line = replace_nth_occurrence(original_line, stripped_original, mutated_code, match_index)
-                            if mutated_line is None:
-                                continue
-                            lines[target_line_index] = mutated_line
-                        else:
-                            start_idx = original_line.find(stripped_original)
-                            if start_idx != -1:
-                                end_idx = start_idx + len(stripped_original)
-                                before = original_line[:start_idx]
-                                after = original_line[end_idx:]
-                                mutated_line = before + mutated_code + after
-                                lines[target_line_index] = mutated_line
+                def replace_all_whole_matches(line: str, old: str, new: str) -> Optional[str]:
+                    if not old:
+                        return None
+                    pattern = rf"(?<!\S){re.escape(old)}(?!\S)"
+                    if not re.search(pattern, line):
+                        return None
+                    return re.sub(pattern, new, line)
+
+                token = original_code.strip()
+                if not token:
+                    continue
+
+                if match_index is not None:
+                    mutated_line = replace_nth_whole_match(original_line, token, mutated_code, match_index)
+                    if mutated_line is None:
+                        continue
+                else:
+                    mutated_line = replace_all_whole_matches(original_line, token, mutated_code)
+                    if mutated_line is None:
+                        continue
+
+                lines[target_line_index] = mutated_line
             
             # Write all changes at once
             with open(source_file, 'w') as f:

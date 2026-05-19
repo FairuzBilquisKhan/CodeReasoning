@@ -1,10 +1,13 @@
 """File operations utilities - PLATFORM INDEPENDENT"""
 
-import shutil
 import os
+import shutil
+import signal
+import subprocess
+import time
 import platform
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 
 class FileOperations:
@@ -77,3 +80,56 @@ class FileOperations:
         except Exception as e:
             print(f"Error writing file {file_path}: {e}")
             return False
+
+
+def kill_processes_for_path(path: Path, timeout: int = 5) -> None:
+    """Kill processes whose command line references the given path (SIGTERM then SIGKILL)."""
+    try:
+        out = subprocess.check_output(["pgrep", "-f", str(path)], text=True).strip()
+        if not out:
+            return
+        pids = [int(p) for p in out.splitlines() if p.strip().isdigit()]
+    except subprocess.CalledProcessError:
+        return
+
+    for pid in pids:
+        try:
+            print(f"   [CLEANUP] Terminating PID {pid} for path {path}")
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            continue
+
+    time.sleep(timeout)
+
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            continue
+        try:
+            print(f"   [CLEANUP] Killing PID {pid} (SIGKILL)")
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+
+def find_java_file_by_class(class_name: str, base_dirs: List[Path]) -> Optional[Path]:
+    """Find Java source file for a fully-qualified class name across base directories.
+
+    Tries direct path, common Maven layouts, then a recursive glob fallback.
+    """
+    if not class_name:
+        return None
+    rel_path = class_name.replace('.', '/') + '.java'
+    for base_dir in base_dirs:
+        direct = base_dir / rel_path
+        if direct.exists():
+            return direct
+        for prefix in ["src/main/java", "src/java"]:
+            maven_path = base_dir / prefix / rel_path
+            if maven_path.exists():
+                return maven_path
+        matches = list(base_dir.rglob(rel_path))
+        if matches:
+            return matches[0]
+    return None

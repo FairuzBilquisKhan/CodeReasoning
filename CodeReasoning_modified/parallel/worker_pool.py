@@ -3,15 +3,13 @@
 import os
 import random
 import shutil
-import time
 import uuid
 import hashlib
-import signal
-import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from core.mutation_applier import MutationApplier
+from utils.file_ops import kill_processes_for_path, find_java_file_by_class
 
 class WorkerPool:
     """Manages parallel execution - REPRODUCIBLE & ISOLATED"""
@@ -42,12 +40,12 @@ class WorkerPool:
         mutant_id = mutant_info['mutant_id']
         
         try:
-            print(f"   [PID {pid}] Processing {project_id}-{bug_id} mutant {mutant_id}")
-            
+            print(f"   [PID {pid}] Processing {project_id}-{bug_id} mutant {mutant_id}", flush=True)
+
             # VALIDATE: Check mutant belongs to correct project/bug
-            if (mutant_info.get('project_id') != project_id or 
+            if (mutant_info.get('project_id') != project_id or
                 mutant_info.get('bug_id') != bug_id):
-                print(f"   [PID {pid}] ERROR: Mutant data mismatch!")
+                print(f"   [PID {pid}] ERROR: Mutant data mismatch!", flush=True)
                 return None
             
             # 1. Create ISOLATED project copy
@@ -68,9 +66,9 @@ class WorkerPool:
                 print(f"      - File/Class: {class_name}, Line: {line_number}, Mutator: {mutator}")
                 print(f"        Original: {original_code}")
                 print(f"        Mutated : {mutated_code}")
-                target_file = mutation_applier.find_java_file_by_class(class_name, source_dirs)
+                target_file = find_java_file_by_class(class_name, source_dirs)
                 if not target_file:
-                    print(f"   [PID {pid}] File not found: {class_name}")
+                    print(f"   [PID {pid}] File not found: {class_name}", flush=True)
                     continue
                 relative_line = mutation_applier.get_relative_line_number(
                     target_file,
@@ -141,7 +139,7 @@ class WorkerPool:
             return result_info
             
         except Exception as e:
-            print(f"   [PID {pid}] Error: {e}")
+            print(f"   [PID {pid}] Error: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return None
@@ -151,7 +149,7 @@ class WorkerPool:
             if "temp_mutant_" in str(mutant_dir):
                 # Kill any lingering processes that reference this mutant directory
                 try:
-                    self._kill_processes_for_path(mutant_dir)
+                    kill_processes_for_path(mutant_dir)
                 except Exception:
                     pass
                 try:
@@ -159,48 +157,6 @@ class WorkerPool:
                 except Exception:
                     pass
 
-    def _kill_processes_for_path(self, path: Path, timeout: int = 5):
-        """Kill processes whose command line references the given path.
-
-        This helps clean up java/ant child processes that can remain after
-        timeouts or errors. We try SIGTERM first, then SIGKILL.
-        """
-        # Use pgrep -f to find processes matching the path string (works on macOS/Linux)
-        try:
-            cmd = ["pgrep", "-f", str(path)]
-            out = subprocess.check_output(cmd, text=True).strip()
-            if not out:
-                return
-            pids = [int(p) for p in out.splitlines() if p.strip().isdigit()]
-        except subprocess.CalledProcessError:
-            # pgrep returns non-zero when no processes matched
-            return
-
-        for pid in pids:
-            try:
-                print(f"   [CLEANUP] Terminating PID {pid} for path {path}")
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                continue
-            except PermissionError:
-                continue
-
-        # Give processes a moment to exit
-        time.sleep(timeout)
-
-        # Force kill any remaining
-        for pid in pids:
-            try:
-                # Check if process still exists
-                os.kill(pid, 0)
-            except OSError:
-                continue
-            try:
-                print(f"   [CLEANUP] Killing PID {pid} (SIGKILL)")
-                os.kill(pid, signal.SIGKILL)
-            except Exception:
-                pass
-    
     def process_mutants_parallel(self, work_dir: Path, mutants_output_dir: Path,
                                mutants: List[Dict], project_id: str, bug_id: str,
                                relative_source_dirs: List[Path]) -> Tuple[List[Dict], List[str]]:
@@ -240,22 +196,29 @@ class WorkerPool:
             worker_args.append(args)
         
         # Execute with isolation
+        total = len(worker_args)
+        print(f"Submitting {total} mutants to {self.max_workers} workers...", flush=True)
         with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_mutant = {}
             for args in worker_args:
                 future = executor.submit(self.process_single_mutant, args)
                 future_to_mutant[future] = args[2]['mutant_id']
-            
+
+            print(f"All {total} tasks submitted. Waiting for results...", flush=True)
+            done_count = 0
             for future in as_completed(future_to_mutant):
                 mutant_id = future_to_mutant[future]
+                done_count += 1
                 try:
                     result = future.result(timeout=1200)  # 20 minute timeout
                     if result and result.get('project_id') == project_id and result.get('bug_id') == bug_id:
                         successful_mutants.append(result)
+                        print(f"[{done_count}/{total}] OK  mutant {mutant_id}", flush=True)
                     else:
                         failed_mutants.append(mutant_id)
+                        print(f"[{done_count}/{total}] SKIP mutant {mutant_id}", flush=True)
                 except Exception as e:
-                    print(f"Worker failed for mutant {mutant_id}: {e}")
+                    print(f"[{done_count}/{total}] FAIL mutant {mutant_id}: {e}", flush=True)
                     failed_mutants.append(mutant_id)
         
         return successful_mutants, failed_mutants

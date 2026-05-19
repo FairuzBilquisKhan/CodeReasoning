@@ -156,7 +156,7 @@ class ProjectManager:
                     failing_tests = row.get('failingTests', '').strip()
                     if not bug_key or not failing_tests:
                         continue
-                    first_test = failing_tests.split(',')[0].strip()
+                    first_test = failing_tests.split(';')[0].strip()
                     if first_test:
                         bug_test_map[bug_key] = first_test
             print(f"[INFO] Loaded {len(bug_test_map)} bug test mappings from {csv_path}")
@@ -170,21 +170,73 @@ class ProjectManager:
         return self._bug_test_map.get(bug_key, "")
 
     def run_mutation_testing(self, work_dir: Path, test_name: str = "") -> bool:
-        """Run mutation testing to generate mutants.log"""
+        """Run mutation testing to generate mutants.log.
+
+        On the buggy version the test suite fails, so defects4j mutation exits
+        non-zero — but mutants.log is still written. We treat success as
+        'mutants.log exists', not as a clean exit code.
+        """
+        mutation_cmd = [DEFECTS4J_EXECUTABLE, "mutation"]
+        if test_name:
+            mutation_cmd.extend(["-t", test_name])
         try:
-            mutation_cmd = [DEFECTS4J_EXECUTABLE, "mutation"]
-            if test_name:
-                mutation_cmd.extend(["-t", test_name])
-            result = subprocess.run(
+            subprocess.run(
                 mutation_cmd,
-                check=True, capture_output=True, text=True, cwd=work_dir,
+                capture_output=True, text=True, cwd=work_dir,
                 timeout=720
             )
-            print("✓ Mutation testing completed")
-            return True
-        except Exception as e:
-            print(f"✗ Mutation testing failed: {e}")
+        except subprocess.TimeoutExpired:
+            print("✗ Mutation testing timed out")
             return False
+        except Exception as e:
+            print(f"✗ Mutation testing failed to run: {e}")
+            return False
+
+        # Success is determined by mutants.log being created, not the exit code
+        mutants_log = next(work_dir.rglob("mutants.log"), None)
+        if mutants_log:
+            print(f"✓ Mutation testing completed — mutants.log found at {mutants_log}")
+            return True
+        print("✗ Mutation testing: mutants.log not found after run")
+        return False
+
+    def run_coverage(self, work_dir: Path, test_name: str = "") -> bool:
+        """Run defects4j coverage on an already-compiled project."""
+        from config.settings import COVERAGE_TIMEOUT
+        defects4j_cmd = self._get_defects4j_command()
+        cmd = [defects4j_cmd, "coverage"]
+        if test_name:
+            cmd.extend(["-t", test_name])
+        else:
+            cmd.extend(["-r"])
+        try:
+            subprocess.run(
+                cmd, check=True, capture_output=True, text=True,
+                cwd=work_dir, timeout=COVERAGE_TIMEOUT
+            )
+            print("✓ Coverage completed")
+            return True
+        except subprocess.TimeoutExpired:
+            print("✗ Coverage timed out")
+            return False
+        except Exception as e:
+            print(f"✗ Coverage failed: {e}")
+            return False
+
+    def export_modified_classes(self, work_dir: Path) -> List[str]:
+        """Run defects4j export -p classes.modified and return list of fully-qualified class names."""
+        try:
+            result = subprocess.run(
+                [self._get_defects4j_command(), "export", "-p", "classes.modified"],
+                capture_output=True, text=True, check=True,
+                cwd=work_dir, timeout=60
+            )
+            classes = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            print(f"   Modified classes ({len(classes)}): {classes}")
+            return classes
+        except Exception as e:
+            print(f"✗ Failed to export modified classes: {e}")
+            return []
 
     def get_source_directories(self, work_dir: Path) -> List[Path]:
         """Find all source directories in the project"""
